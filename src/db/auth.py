@@ -41,7 +41,8 @@ def _verify_password(password: str, hashed: str) -> bool:
 def login(username: str, password: str) -> dict | None:
     """
     ログイン認証。成功時はユーザー情報dict、失敗時はNoneを返す。
-    DBが使えない場合は .env のレガシー認証にフォールバック。
+    1. Supabase usersテーブルで照合
+    2. ユーザーが見つからない or DB接続失敗 → 環境変数(APP_USERNAME/APP_PASSWORD)でフォールバック
     """
     sb = get_supabase()
     if sb is None:
@@ -49,12 +50,14 @@ def login(username: str, password: str) -> dict | None:
 
     try:
         res = sb.table("users").select("*").eq("username", username).eq("is_active", True).execute()
-        if not res.data:
+        if res.data:
+            user = res.data[0]
+            if _verify_password(password, user["password_hash"]):
+                return user
+            # DBにユーザーはいるがパスワードが違う → 認証失敗
             return None
-        user = res.data[0]
-        if not _verify_password(password, user["password_hash"]):
-            return None
-        return user
+        # DBにユーザーが存在しない → 環境変数フォールバック
+        return _legacy_login(username, password)
     except Exception:
         return _legacy_login(username, password)
 
