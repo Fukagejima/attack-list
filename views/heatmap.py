@@ -1,5 +1,6 @@
 ﻿"""業界3Cヒートマップ ビュー"""
 import streamlit as st
+from collections import defaultdict
 from src.agent.claude_agent import analyze_all_industries
 from src.data_fetcher.industry_search import fetch_industry_web_context, fetch_broad_market_context
 from config.industries import ALL_INDUSTRIES, INDUSTRY_CATEGORIES
