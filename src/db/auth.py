@@ -1,16 +1,30 @@
 """ユーザー認証・管理"""
 from __future__ import annotations
-import bcrypt
 from src.db.client import get_supabase
+
+try:
+    import bcrypt
+    _BCRYPT_OK = True
+except Exception:
+    _BCRYPT_OK = False
 
 
 def _hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    if _BCRYPT_OK:
+        return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    import hashlib, os
+    salt = os.urandom(16).hex()
+    return salt + ":" + hashlib.sha256((salt + password).encode()).hexdigest()
 
 
 def _verify_password(password: str, hashed: str) -> bool:
     try:
-        return bcrypt.checkpw(password.encode(), hashed.encode())
+        if _BCRYPT_OK and hashed.startswith("$2"):
+            return bcrypt.checkpw(password.encode(), hashed.encode())
+        # フォールバック：salt:hash 形式
+        salt, h = hashed.split(":", 1)
+        import hashlib
+        return hashlib.sha256((salt + password).encode()).hexdigest() == h
     except Exception:
         return False
 
