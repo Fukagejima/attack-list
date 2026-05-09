@@ -1,0 +1,1 @@
+# SharePoint Masking Agent - placeholder

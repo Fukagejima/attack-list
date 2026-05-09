@@ -1,0 +1,31 @@
+# 環境変数・秘密情報（絶対にGitHubに上げない）
+.env
+*.env
+
+# Python キャッシュ
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# 出力ファイル（生成物は含めない）
+output/
+logs/
+
+# OS生成ファイル
+.DS_Store
+Thumbs.db
+
+# エディタ設定
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# ログ・一時ファイル
+*.log
+streamlit.log
+
+# Claude Code設定（ローカル専用）
+.claude/
