@@ -1,8 +1,5 @@
-[ui]
-hideSidebarNav = true
-
 [server]
-headless = false
+headless = true
 
 [theme]
 base = "dark"
