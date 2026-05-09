@@ -1,13 +1,14 @@
 """
 Claude API エージェント
-- 全業界網羅3C分析
-- 企業スコアリング・アタックリスト生成
+- 全業界網羅3C分析（Haiku並列処理で高速化）
+- 企業スコアリング・アタックリスト生成（Sonnet）
 """
 from __future__ import annotations
 import json
 import re
+import concurrent.futures
 import anthropic
-from config.settings import ANTHROPIC_API_KEY, CLAUDE_MODEL
+from config.settings import ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_HAIKU_MODEL
 from config.industries import ALL_INDUSTRIES, INDUSTRY_TO_CATEGORY
 from utils.logger import get_logger
 
@@ -25,64 +26,152 @@ CRITICAL OUTPUT RULES:
 - Scores are integers 1-100.
 - Evaluation must be one of: ◎ ○ △ ×"""
 
+_BATCH_SIZE = 15
+
 
 def _clean_json(raw: str) -> str:
-    """Claude が返した文字列を valid JSON に修正する"""
-    # コードブロック除去
     raw = re.sub(r"```(?:json)?", "", raw).strip()
     raw = raw.rstrip("`").strip()
-
-    # 日本語引用符 → ASCII ダブルクォート
     raw = raw.replace("「", '"').replace("」", '"')
-    raw = raw.replace("「", '"').replace("」", '"')
-
-    # シングルクォートをダブルクォートに（値部分のみ、JSONキー周辺）
-    # キーの前後: {'key': 'val'} → {"key": "val"}
-    raw = re.sub(r"'([^']*)'(\s*:)", r'"\1"\2', raw)   # 'key':
-    raw = re.sub(r":\s*'([^']*)'", r': "\1"', raw)      # : 'val'
-
-    # 末尾カンマ除去（JSON非対応）
+    raw = re.sub(r"'([^']*)'(\s*:)", r'"\1"\2', raw)
+    raw = re.sub(r":\s*'([^']*)'", r': "\1"', raw)
     raw = re.sub(r",\s*([}\]])", r"\1", raw)
-
     return raw
 
 
 def _parse_json_safe(raw: str) -> list | dict:
-    """JSONパースを複数段階でリトライする"""
-    # 1st try: そのまま
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-
-    # 2nd try: クリーニング後
-    cleaned = _clean_json(raw)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # 3rd try: [...] ブロック抽出
-    m = re.search(r"\[.*\]", cleaned, re.DOTALL)
-    if m:
+    for attempt in (raw, _clean_json(raw)):
         try:
-            return json.loads(m.group(0))
+            return json.loads(attempt)
         except json.JSONDecodeError:
             pass
-
-    # 4th try: {...} ブロック抽出（単一オブジェクトの場合）
-    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if m:
-        try:
-            return [json.loads(m.group(0))]
-        except json.JSONDecodeError:
-            pass
-
+    for pattern in (r"\[.*\]", r"\{.*\}"):
+        m = re.search(pattern, _clean_json(raw), re.DOTALL)
+        if m:
+            try:
+                result = json.loads(m.group(0))
+                return result if isinstance(result, list) else [result]
+            except json.JSONDecodeError:
+                pass
     raise ValueError(f"JSONパース失敗。先頭300文字:\n{raw[:300]}")
 
 
-# 業界リストを分割してバッチ処理
-_BATCH_SIZE = 15
+def _make_industry_prompt(
+    batch: list[str],
+    batch_idx: int,
+    total_batches: int,
+    company_name: str,
+    service_name: str,
+    strengths: str,
+    existing_industry: str,
+    target_revenue_scale: str,
+    col1_label: str,
+    col2_label: str,
+    broad_context: str,
+    existing_list_context: str,
+    ctx_block: str,
+) -> str:
+    """各バッチ用のプロンプトを生成"""
+    if col1_label and col2_label:
+        label_instruction = f"""
+### Company axis labels (FIXED - use exactly these)
+fit_column1_label = "{col1_label}"
+fit_column2_label = "{col2_label}" """
+    else:
+        label_instruction = f"""
+### Company axis labels (decide based on service characteristics)
+Name 2 axes showing how well each industry fits "{service_name}".
+e.g. for AI consulting: "AI導入意欲" and "予算規模適合" """
+
+    eval_instruction = f"""
+## Evaluation rule (STRICT)
+Across all {len(ALL_INDUSTRIES)} industries total, ◎ should be 3+, ○ should be 5+.
+In THIS batch of {len(batch)}: assign ◎ to top 1-2, ○ to next 2-3. Never assign only △/×."""
+
+    return f"""Analyze industries for a Japanese company. Return ONLY a JSON array.
+
+## Company Info
+- Company: {company_name}
+- Service: {service_name}
+- Strengths: {strengths}
+- Current clients: {existing_industry}
+{f"- Target revenue scale: {target_revenue_scale}" if target_revenue_scale else ""}
+{f"- Market context: {broad_context[:300]}" if broad_context else ""}
+{existing_list_context[:600] if existing_list_context else ""}
+{ctx_block}
+
+## Industries to analyze (ALL of them, batch {batch_idx+1}/{total_batches})
+{json.dumps(batch, ensure_ascii=False)}
+
+{label_instruction}
+{eval_instruction}
+
+## Output (JSON array only)
+[{{"industry":"name","category":"カテゴリ名","market_size":"X兆円","growth_actual":"+X%","growth_future":"+X%","market_overview":"概況1〜2文","fit_column1_label":"ラベル1","fit_column1":"コメント","fit_column2_label":"ラベル2","fit_column2":"コメント","competitor_summary":"競合状況","evaluation":"◎","score":85}}]
+
+Return ONLY the JSON array."""
+
+
+def _call_batch(
+    batch: list[str],
+    batch_idx: int,
+    total_batches: int,
+    company_name: str,
+    service_name: str,
+    strengths: str,
+    existing_industry: str,
+    target_revenue_scale: str,
+    col1_label: str,
+    col2_label: str,
+    broad_context: str,
+    existing_list_context: str,
+    web_contexts: dict,
+) -> tuple[int, list[dict]]:
+    """1バッチ分の分析を実行して (batch_idx, results) を返す"""
+    ctx_block = ""
+    if web_contexts:
+        for ind in batch:
+            ctx = web_contexts.get(ind, "")
+            if ctx:
+                ctx_block += f"\n[{ind}] {ctx[:150]}"
+
+    prompt = _make_industry_prompt(
+        batch, batch_idx, total_batches, company_name, service_name,
+        strengths, existing_industry, target_revenue_scale,
+        col1_label, col2_label, broad_context, existing_list_context, ctx_block,
+    )
+
+    try:
+        resp = client.messages.create(
+            model=CLAUDE_HAIKU_MODEL,   # ← Haiku で高速処理
+            max_tokens=4096,
+            system=[{"type": "text", "text": SYSTEM_PROMPT,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.content[0].text.strip()
+        batch_data = _parse_json_safe(raw)
+
+        # カテゴリ補完
+        for item in batch_data:
+            if not item.get("category"):
+                item["category"] = INDUSTRY_TO_CATEGORY.get(item.get("industry", ""), "その他")
+
+        logger.info(f"バッチ{batch_idx+1} 完了: {len(batch_data)}業界")
+        return batch_idx, batch_data
+
+    except Exception as e:
+        logger.error(f"バッチ{batch_idx+1} エラー: {e}")
+        fallback = [{
+            "industry": ind,
+            "category": INDUSTRY_TO_CATEGORY.get(ind, "その他"),
+            "market_size": "—", "growth_actual": "—", "growth_future": "—",
+            "market_overview": "取得エラー（再分析してください）",
+            "fit_column1_label": col1_label or "適合度①", "fit_column1": "—",
+            "fit_column2_label": col2_label or "適合度②", "fit_column2": "—",
+            "competitor_summary": "—", "evaluation": "△", "score": 0,
+        } for ind in batch]
+        return batch_idx, fallback
 
 
 def analyze_all_industries(
@@ -97,160 +186,52 @@ def analyze_all_industries(
 ) -> list[dict]:
     """
     全業界を網羅的に3C分析。
-    バッチ処理で分割して速度向上 + JSON安定化。
+    Haiku モデル + 並列バッチ処理で高速化（約1/3の時間）。
     """
+    batches = [ALL_INDUSTRIES[i:i + _BATCH_SIZE]
+               for i in range(0, len(ALL_INDUSTRIES), _BATCH_SIZE)]
+    total = len(batches)
+    logger.info(f"全業界分析開始: {len(ALL_INDUSTRIES)}業界 / {total}バッチ / モデル: {CLAUDE_HAIKU_MODEL}")
+
+    # ── STEP1: バッチ0を先に実行してColumn軸ラベルを確定 ──────────────────────
+    # （ラベルは全バッチで統一するため、1件だけ先行実行）
+    _, first_results = _call_batch(
+        batches[0], 0, total, company_name, service_name, strengths,
+        existing_industry, target_revenue_scale, "", "", broad_context,
+        existing_list_context, web_contexts or {},
+    )
+
+    col1_label = first_results[0].get("fit_column1_label", "適合度①") if first_results else "適合度①"
+    col2_label = first_results[0].get("fit_column2_label", "適合度②") if first_results else "適合度②"
+    logger.info(f"Column軸ラベル確定: {col1_label} / {col2_label}")
+
+    # ── STEP2: 残りのバッチを並列実行 ─────────────────────────────────────────
+    remaining = batches[1:]
+    all_results_map: dict[int, list] = {0: first_results}
+
+    if remaining:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(remaining)) as executor:
+            futures = {
+                executor.submit(
+                    _call_batch,
+                    batch, idx + 1, total, company_name, service_name, strengths,
+                    existing_industry, target_revenue_scale, col1_label, col2_label,
+                    broad_context, existing_list_context, web_contexts or {},
+                ): idx + 1
+                for idx, batch in enumerate(remaining)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                batch_idx, results = future.result()
+                all_results_map[batch_idx] = results
+
+    # ── バッチ順に結合 ─────────────────────────────────────────────────────────
     all_results: list[dict] = []
-    batches = [
-        ALL_INDUSTRIES[i:i + _BATCH_SIZE]
-        for i in range(0, len(ALL_INDUSTRIES), _BATCH_SIZE)
-    ]
-    logger.info(f"全業界分析: {len(ALL_INDUSTRIES)}業界 / {len(batches)}バッチ")
-
-    # Company軸ラベルは1回目のバッチで確定させ、以降は使い回す
-    col1_label: str = ""
-    col2_label: str = ""
-
-    for batch_idx, batch in enumerate(batches):
-        logger.info(f"バッチ {batch_idx+1}/{len(batches)}: {batch}")
-
-        # ウェブコンテキストをこのバッチ分だけ添付
-        ctx_block = ""
-        if web_contexts:
-            for ind in batch:
-                ctx = web_contexts.get(ind, "")
-                if ctx:
-                    ctx_block += f"\n[{ind}] {ctx[:200]}"
-
-        label_instruction = ""
-        if batch_idx == 0:
-            label_instruction = f"""
-### Company軸の命名（このバッチで決定し、以降のバッチでも同じラベルを使うこと）
-"{service_name}" の特性を踏まえ、業界との相性を表す2つの観点を命名してください。
-例: サービスがSNSマーケなら「インフルエンサー適合性」「SNS広告効率」など"""
-        else:
-            label_instruction = f"""
-### Company軸のラベル（固定）
-fit_column1_label = "{col1_label}"
-fit_column2_label = "{col2_label}"
-上記のラベルを必ず使うこと。"""
-
-        industries_str = json.dumps(batch, ensure_ascii=False)
-
-        # 全バッチ共通のevaluation分布指示（全体で◎/○が必ず出るよう）
-        eval_distribution = ""
-        if batch_idx == 0:
-            eval_distribution = f"""
-## Evaluation distribution rule (STRICT)
-Across ALL {len(ALL_INDUSTRIES)} industries analyzed in all batches combined:
-- ◎ (最優先): assign to at least 3 industries — the best fits for this service
-- ○ (優先): assign to at least 5 industries — good fits
-- △ (要検討): moderate fit
-- × (優先度低): poor fit
-For THIS batch of {len(batch)} industries, assign ◎ to the top 1-2 and ○ to the next 2-3 if they qualify.
-Do NOT assign only △ and × — always find the relative best industries in each batch."""
-        else:
-            eval_distribution = f"""
-## Evaluation distribution rule (STRICT)
-Even in this batch, assign ◎ to the 1-2 best-fitting industries and ○ to the next 2-3.
-Do NOT assign only △ and × to all industries in this batch."""
-
-        prompt = f"""Analyze the following industries for a Japanese company and return a JSON array.
-
-## Company Info
-- Company: {company_name}
-- Service: {service_name}
-- Strengths: {strengths}
-- Current main clients: {existing_industry}
-{f"- Target company revenue scale: {target_revenue_scale}" if target_revenue_scale else ""}
-{f"- Market context: {broad_context[:400]}" if broad_context else ""}
-{existing_list_context[:800] if existing_list_context else ""}
-{ctx_block}
-
-## Industries to analyze (analyze ALL of them)
-{industries_str}
-
-{label_instruction}
-{eval_distribution}
-
-## Output format (JSON array, one object per industry)
-Return ONLY a JSON array like this:
-[
-  {{
-    "industry": "exact industry name from input list",
-    "category": "parent category name in Japanese",
-    "market_size": "market size e.g. 3兆円 or 6,300億円（推定）",
-    "growth_actual": "recent 3yr growth e.g. +3〜4%",
-    "growth_future": "future 3yr forecast e.g. +3〜5%",
-    "market_overview": "market overview in 1-2 Japanese sentences",
-    "fit_column1_label": "Company axis 1 label",
-    "fit_column1": "evaluation comment 1 sentence",
-    "fit_column2_label": "Company axis 2 label",
-    "fit_column2": "evaluation comment 1 sentence",
-    "competitor_summary": "competitor situation 1 sentence",
-    "evaluation": "◎",
-    "score": 85,
-    "data_source_note": "data source note"
-  }}
-]
-
-IMPORTANT: Output ONLY the JSON array. No other text."""
-
-        try:
-            resp = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=4096,
-                system=[{
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }],
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = resp.content[0].text.strip()
-            logger.debug(f"バッチ{batch_idx+1} 先頭200文字: {raw[:200]}")
-
-            batch_data = _parse_json_safe(raw)
-
-            # Company軸ラベルを1バッチ目で固定
-            if batch_idx == 0 and batch_data:
-                col1_label = batch_data[0].get("fit_column1_label", col1_label)
-                col2_label = batch_data[0].get("fit_column2_label", col2_label)
-
-            # カテゴリ補完
-            for item in batch_data:
-                if not item.get("category"):
-                    item["category"] = INDUSTRY_TO_CATEGORY.get(
-                        item.get("industry", ""), "その他"
-                    )
-                # ラベルを統一
-                if col1_label:
-                    item["fit_column1_label"] = col1_label
-                if col2_label:
-                    item["fit_column2_label"] = col2_label
-
-            all_results.extend(batch_data)
-            logger.info(f"バッチ{batch_idx+1} 完了: {len(batch_data)}業界取得")
-
-        except Exception as e:
-            logger.error(f"バッチ{batch_idx+1} エラー: {e}")
-            # エラーが出たバッチはスキップしてフォールバックデータを追加
-            for ind in batch:
-                all_results.append({
-                    "industry": ind,
-                    "category": INDUSTRY_TO_CATEGORY.get(ind, "その他"),
-                    "market_size": "—",
-                    "growth_actual": "—",
-                    "growth_future": "—",
-                    "market_overview": "取得エラー（再分析をお試しください）",
-                    "fit_column1_label": col1_label or "適合度①",
-                    "fit_column1": "—",
-                    "fit_column2_label": col2_label or "適合度②",
-                    "fit_column2": "—",
-                    "competitor_summary": "—",
-                    "evaluation": "△",
-                    "score": 0,
-                    "data_source_note": f"エラー: {e}",
-                })
+    for i in range(total):
+        batch_data = all_results_map.get(i, [])
+        for item in batch_data:
+            item["fit_column1_label"] = col1_label
+            item["fit_column2_label"] = col2_label
+        all_results.extend(batch_data)
 
     all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
     logger.info(f"全業界分析完了: {len(all_results)}業界")
@@ -266,7 +247,7 @@ def generate_attack_list(
     target_revenue_scale: str = "",
     existing_list_context: str = "",
 ) -> list[dict]:
-    """対象業界の具体企業リストとスコアを生成"""
+    """対象業界の具体企業リストとスコアを生成（Sonnet で高精度）"""
     industry_list_str = "\n".join(f"- {ind}" for ind in target_industries)
 
     prompt = f"""Generate a sales attack list of real Japanese companies for the following service.
@@ -309,19 +290,15 @@ For estimated values, append （推定）.
 total_score = (icp_fit*0.4 + solution_fit*0.35 + competitor_saturation*0.25) * 10
 data_confidence: high=IR confirmed / medium=estimated / low=uncertain"""
 
-    logger.info(f"アタックリスト生成: {target_industries}")
+    logger.info(f"アタックリスト生成: {target_industries} / モデル: {CLAUDE_MODEL}")
     resp = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=8192,
-        system=[{
-            "type": "text",
-            "text": SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }],
+        system=[{"type": "text", "text": SYSTEM_PROMPT,
+                 "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": prompt}],
     )
     raw = resp.content[0].text.strip()
-
     data = _parse_json_safe(raw)
     logger.info(f"アタックリスト完了: {len(data)}社")
     return data

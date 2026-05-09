@@ -11,7 +11,8 @@ APP_PASSWORD = os.getenv("APP_PASSWORD", "password123")
 
 # ── Anthropic API ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_MODEL       = "claude-sonnet-4-6"   # アタックリスト生成（高精度）
+CLAUDE_HAIKU_MODEL = "claude-haiku-4-5"    # 3C分析（高速・低コスト）
 
 # ── スクレイピング設定 ─────────────────────────────────────────────────────────
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY_SECONDS", "2.0"))
