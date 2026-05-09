@@ -18,13 +18,22 @@ def _hash_password(password: str) -> str:
 
 
 def _verify_password(password: str, hashed: str) -> bool:
+    import hashlib
     try:
-        if _BCRYPT_OK and hashed.startswith("$2"):
-            return bcrypt.checkpw(password.encode(), hashed.encode())
-        # フォールバック：salt:hash 形式
-        salt, h = hashed.split(":", 1)
-        import hashlib
-        return hashlib.sha256((salt + password).encode()).hexdigest() == h
+        # bcrypt形式 ($2b$ または $2a$)
+        if hashed.startswith("$2"):
+            if _BCRYPT_OK:
+                return bcrypt.checkpw(password.encode(), hashed.encode())
+            return False
+        # TEMP:sha256形式（初期セットアップ用）
+        if hashed.startswith("TEMP:"):
+            h = hashed[5:]
+            return hashlib.sha256(password.encode()).hexdigest() == h
+        # salt:sha256形式（bcryptなし環境）
+        if ":" in hashed:
+            salt, h = hashed.split(":", 1)
+            return hashlib.sha256((salt + password).encode()).hexdigest() == h
+        return False
     except Exception:
         return False
 
