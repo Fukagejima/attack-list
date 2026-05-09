@@ -29,3 +29,6 @@ streamlit.log
 
 # Claude Code設定（ローカル専用）
 .claude/
+
+# 旧マルチページ構成（app.pyのシングルページルーターに統合済み）
+pages/
